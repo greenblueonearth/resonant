@@ -1,6 +1,6 @@
 # Resonant
 
-Resonant is a minimal, fast, Sui-inspired Rust blockchain demo focused on:
+Resonant is a minimal, fast, Rust based blockchain demo focused on:
 - low-overhead transaction flow
 - stealth-style masking for transaction privacy
 - post-quantum-inspired hash-based security design
