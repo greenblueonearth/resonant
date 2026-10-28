@@ -1,14 +1,14 @@
 # Resonant
 
-Resonant is a compact Rust blockchain demo inspired by the speed and simplicity goals of Sui-style architectures, while focusing on a small, local, and testable implementation.
+Resonant is a compact Rust blockchain demo inspired by the speed and simplicity goals of Sui-style architectures, while focusing on a local, testable implementation with lightweight P2P networking.
 
-## What it includes
-- lightweight blockchain ledger
+## What is included
 - wallet generation and account management
-- in-memory local node simulation
 - transaction mempool and block mining
-- privacy-oriented transaction design via stealth commitment and nullifier
-- hash-based security model inspired by post-quantum direction without being a full cryptographic suite
+- hash-based ledger structure using BLAKE3
+- stealth commitment and nullifier patterns for privacy-inspired transaction flow
+- local peer-to-peer node communication over TCP sockets
+- CLI for demoing wallet and network behavior
 
 ## Quick start
 
@@ -24,16 +24,20 @@ cargo run -- node demo
 cargo run -- node run alpha
 ```
 
-## Local network demo
+## P2P model
 
-The node system exposes a lightweight network model with three sample nodes (`alpha`, `beta`, and `gamma`) to test the flow of transactions and mining locally.
+This version includes a lightweight P2P layer for local testing:
+- nodes bind to localhost ports
+- peers are configured as socket endpoints
+- transactions and mined blocks are broadcast between peers as JSON messages
+- the demo creates three local nodes (`alpha`, `beta`, and `gamma`) for a small network simulation
 
 ## Notes
-This is a learning and demo project designed for experimentation and local development. It is intentionally not a production-grade blockchain or a complete cryptographic protocol.
+This is an educational and demo project. It is not a production blockchain, not a formal cryptographic implementation, and not a fully audited consensus system.
 
-## Future upgrades
-- real P2P TCP/UDP node communication
-- wallet signing and verification
-- stake or validator simulation
-- zero-knowledge style transaction shielding
-- more realistic consensus model
+## Recommended next upgrades
+- validator or stake simulation
+- node synchronization rules and conflict handling
+- wallet signing / verification
+- more realistic state replication across peers
+- zero-knowledge style shielding for transactions
