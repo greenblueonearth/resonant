@@ -3,7 +3,7 @@ name = "resonant"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "A lightweight Sui-inspired Rust blockchain demo with privacy and post-quantum inspired hashing"
+description = "Resonant blockchain demo with wallets, node simulation, and local network flow"
 
 [dependencies]
 blake3 = "1.5"
