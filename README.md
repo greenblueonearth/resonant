@@ -1,13 +1,13 @@
 # Resonant
 
-Resonant is a compact Rust blockchain demo inspired by the speed and simplicity goals of Sui-style architectures, while staying small, local, and easy to compile.
+Resonant is a compact Rust blockchain demo inspired by Sui-style speed goals and privacy-oriented transaction design. This version is optimized for local benchmarking and keeps the system simple enough to understand and extend.
 
-## Features
-- wallet generation and balance tracking
-- mempool and block mining
-- stealth commitment and nullifier patterns for privacy-inspired transactions
-- local multi-node simulation for a lightweight blockchain demo
-- hash-based security model using BLAKE3
+## What is included
+- lightweight blockchain ledger
+- wallet balance system
+- transaction mempool and block mining
+- privacy-inspired stealth commitment and nullifier logic
+- synthetic benchmark mode to measure throughput locally
 
 ## Quick start
 
@@ -19,14 +19,24 @@ cargo run -- wallet create tester
 cargo run -- transfer alice bob 250
 cargo run -- mine
 cargo run -- pending
-cargo run -- node demo
+cargo run -- benchmark 20000 2000
 ```
 
-## Notes
-This project is intentionally a learning/demo implementation. It is not a production-grade blockchain or a complete cryptographic protocol.
+## Benchmark
 
-## Next improvements
-- validator/stake simulation
-- wallet signing and verification
-- state synchronization between nodes
-- stronger privacy primitives
+The benchmark is designed to measure the local in-memory throughput of the ledger and block-minting model. It is not a production consensus benchmark, but it provides a meaningful synthetic target for the system's performance profile.
+
+Example:
+
+```bash
+cargo run -- benchmark 20000 2000
+```
+
+This will simulate 20,000 transactions in batches of 2,000 and print the throughput in tx/s.
+
+## Expected performance
+
+In a synthetic local benchmark, the project is designed to target roughly 20,000 tx/s on a modern machine in a single-process in-memory scenario. Real-world production throughput will be lower once network, disk, consensus, and signature validation are included.
+
+## Notes
+This is a learning/demo implementation. It is intentionally simplified and not a production-grade blockchain or audited cryptographic protocol.

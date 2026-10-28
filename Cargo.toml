@@ -3,7 +3,7 @@ name = "resonant"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Resonant: a compile-clean Rust blockchain demo with lightweight local-node simulation"
+description = "Resonant: optimized Rust blockchain demo with local benchmark tooling"
 
 [dependencies]
 blake3 = "1.5"
