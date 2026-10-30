@@ -7,5 +7,9 @@ description = "Resonant v2: a cleaner Rust blockchain demo with modular structur
 
 [dependencies]
 blake3 = "1.5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+fs2 = "0.4"
+hex = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

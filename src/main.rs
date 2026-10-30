@@ -1,307 +1,237 @@
-use crate::wallet::Wallet;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use fs2::FileExt;
+use resonant::ledger::{run_benchmark, Ledger};
+use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Transaction {
-    pub id: String,
-    pub sender: String,
-    pub recipient: String,
-    pub amount: u64,
-    pub fee: u64,
-    pub nonce: u64,
-    pub timestamp: i64,
-    pub stealth_commitment: String,
-    pub nullifier: String,
-    pub signature: String,
-}
-
-impl Transaction {
-    pub fn hash(&self) -> String {
-        let payload = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            self.id,
-            self.sender,
-            self.recipient,
-            self.amount,
-            self.fee,
-            self.nonce,
-            self.timestamp,
-            self.stealth_commitment,
-            self.nullifier,
-            self.signature,
-        );
-
-        format!("{:x}", blake3::hash(payload.as_bytes()))
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Block {
-    pub index: u64,
-    pub timestamp: i64,
-    pub prev_hash: String,
-    pub transactions: Vec<Transaction>,
-    pub merkle_root: String,
-    pub hash: String,
-}
-
-impl Block {
-    pub fn genesis() -> Self {
-        let timestamp = unix_now();
-        let prev_hash = "GENESIS".to_string();
-        let hash = format!(
-            "{:x}",
-            blake3::hash(format!("{}:{}:genesis", timestamp, prev_hash).as_bytes())
-        );
-
-        Self {
-            index: 0,
-            timestamp,
-            prev_hash,
-            transactions: Vec::new(),
-            merkle_root: "0x0".to_string(),
-            hash,
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BenchmarkResult {
-    pub tx_count: u64,
-    pub elapsed_ms: f64,
-    pub tx_per_second: f64,
-    pub block_count: u64,
+fn run() -> Result<(), String> {
+    let mut args = std::env::args().skip(1);
+    let command = args.next();
+    if matches!(command.as_deref(), Some("help") | None) {
+        print_usage();
+        return Ok(());
+    }
+
+    let _state_lock = if command.as_deref() == Some("benchmark") {
+        None
+    } else {
+        Some(lock_state_file()?)
+    };
+    let mut ledger = if command.as_deref() == Some("benchmark") {
+        Ledger::new()
+    } else {
+        load_ledger()?
+    };
+
+    match command.as_deref() {
+        Some("status") => println!("{}", ledger.status()),
+        Some("balance") => {
+            let account = required_arg(&mut args, "account")?;
+            println!("{}: {}", account, ledger.balance_of(&account));
+        }
+        Some("stake") => {
+            let account = required_arg(&mut args, "validator account")?;
+            let amount = parse_u64(&required_arg(&mut args, "stake amount")?, "stake amount")?;
+            let total_stake = ledger.stake(&account, amount)?;
+            save_ledger(&ledger)?;
+            println!(
+                "{} staked {}; total stake: {}",
+                account, amount, total_stake
+            );
+        }
+        Some("wallet") => match args.next().as_deref() {
+            Some("list") => {
+                for (account, balance) in ledger.accounts() {
+                    println!("{}: {}", account, balance);
+                }
+            }
+            Some("create") => {
+                let label = required_arg(&mut args, "label")?;
+                let wallet = ledger.create_wallet(&label);
+                save_ledger(&ledger)?;
+                println!("{} {}", wallet.label, wallet.address);
+            }
+            _ => return Err("usage: resonant wallet <list|create LABEL>".to_string()),
+        },
+        Some("transfer") => {
+            let sender = required_arg(&mut args, "sender")?;
+            let recipient = required_arg(&mut args, "recipient")?;
+            let amount = parse_u64(&required_arg(&mut args, "amount")?, "amount")?;
+            let tx = ledger.transfer(&sender, &recipient, amount)?;
+            save_ledger(&ledger)?;
+            println!("created {} (fee: {})", tx.id, tx.fee);
+        }
+        Some("mine") => {
+            let block = ledger.mine_block()?;
+            save_ledger(&ledger)?;
+            println!(
+                "mined block {} by {} with {} transaction(s): {}",
+                block.index,
+                block.validator,
+                block.transactions.len(),
+                block.hash
+            );
+        }
+        Some("pending") => {
+            if ledger.pending.is_empty() {
+                println!("no pending transactions");
+            } else {
+                for tx in &ledger.pending {
+                    println!(
+                        "{}: {} -> {} ({})",
+                        tx.id, tx.sender, tx.recipient, tx.amount
+                    );
+                }
+            }
+        }
+        Some("benchmark") => {
+            let tx_count = args
+                .next()
+                .map(|value| parse_u64(&value, "transaction count"))
+                .transpose()?
+                .unwrap_or(20_000);
+            let batch_size = args
+                .next()
+                .map(|value| parse_u64(&value, "batch size"))
+                .transpose()?
+                .unwrap_or(2_000);
+            let result = run_benchmark(tx_count, batch_size);
+            println!(
+                "transactions: {}\nelapsed_ms: {:.2}\ntx_per_second: {:.2}\nblocks: {}",
+                result.tx_count, result.elapsed_ms, result.tx_per_second, result.block_count
+            );
+        }
+        Some("help") | None => print_usage(),
+        Some(other) => return Err(format!("unknown command: {other}\n{}", usage())),
+    }
+
+    Ok(())
 }
 
-#[derive(Clone, Debug)]
-pub struct Ledger {
-    balances: HashMap<String, u64>,
-    pub pending: Vec<Transaction>,
-    chain: Vec<Block>,
-    nonce: u64,
+fn state_path() -> PathBuf {
+    std::env::var_os("RESONANT_LEDGER_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".resonant-ledger.json"))
 }
 
-impl Ledger {
-    pub fn new() -> Self {
-        let mut balances = HashMap::new();
-        for label in [
-            "alice", "bob", "charlie", "dana", "erin", "frank", "grace", "henry",
-        ] {
-            balances.insert(label.to_string(), 1_000_000_000u64);
-        }
-
-        Self {
-            balances,
-            pending: Vec::new(),
-            chain: vec![Block::genesis()],
-            nonce: 0,
-        }
-    }
-
-    pub fn create_wallet(&mut self, label: &str) -> Wallet {
-        let wallet = Wallet::new(label);
-        self.balances.insert(wallet.address.clone(), 10_000u64);
-        wallet
-    }
-
-    pub fn transfer(&mut self, sender: &str, recipient: &str, amount: u64) -> Result<Transaction, String> {
-        if sender == recipient {
-            return Err("sender and recipient must be different".to_string());
-        }
-        if amount == 0 {
-            return Err("amount must be greater than zero".to_string());
-        }
-
-        let sender_balance = self.balances.get(sender).copied().unwrap_or(0);
-        if sender_balance < amount {
-            return Err(format!(
-                "insufficient funds: {} has {} but tries to send {}",
-                sender, sender_balance, amount
-            ));
-        }
-
-        self.nonce += 1;
-        let timestamp = unix_now();
-        let fee = 1;
-        let stealth_commitment = compute_stealth_commitment(sender, recipient, self.nonce, amount, timestamp);
-        let nullifier = compute_nullifier(sender, self.nonce);
-        let signature = compute_signature(sender, recipient, amount, self.nonce, &stealth_commitment);
-
-        let tx = Transaction {
-            id: format!("tx-{}", self.nonce),
-            sender: sender.to_string(),
-            recipient: recipient.to_string(),
-            amount,
-            fee,
-            nonce: self.nonce,
-            timestamp,
-            stealth_commitment,
-            nullifier,
-            signature,
-        };
-
-        self.pending.push(tx.clone());
-        Ok(tx)
-    }
-
-    pub fn mine_block(&mut self) -> Block {
-        let mut txs = std::mem::take(&mut self.pending);
-        let prev_hash = self.chain.last().unwrap().hash.clone();
-        let timestamp = unix_now();
-
-        let mut tx_hashes = Vec::with_capacity(txs.len());
-        for tx in &txs {
-            tx_hashes.push(tx.hash());
-            let sender_balance = self.balances.get_mut(&tx.sender).unwrap();
-            *sender_balance = sender_balance.saturating_sub(tx.amount + tx.fee);
-            let recipient_balance = self.balances.entry(tx.recipient.clone()).or_insert(0);
-            *recipient_balance = recipient_balance.saturating_add(tx.amount);
-        }
-
-        let merkle_root = compute_merkle_root(&tx_hashes);
-        let block_hash_input = format!(
-            "{}|{}|{}|{}|{}",
-            self.chain.len(),
-            prev_hash,
-            timestamp,
-            merkle_root,
-            tx_hashes.join("|")
-        );
-        let hash = format!("{:x}", blake3::hash(block_hash_input.as_bytes()));
-
-        let block = Block {
-            index: self.chain.len() as u64,
-            timestamp,
-            prev_hash,
-            transactions: txs,
-            merkle_root,
-            hash,
-        };
-
-        self.chain.push(block.clone());
-        block
-    }
-
-    pub fn balance_of(&self, account: &str) -> u64 {
-        *self.balances.get(account).unwrap_or(&0)
-    }
-
-    pub fn status(&self) -> String {
-        let last = self.chain.last().unwrap();
-        let mut lines = vec![
-            "Resonant v2 status".to_string(),
-            format!("blocks: {}", self.chain.len()),
-            format!("last_hash: {}", last.hash),
-            format!("pending_tx: {}", self.pending.len()),
-        ];
-
-        let mut accounts: Vec<_> = self.balances.keys().cloned().collect();
-        accounts.sort();
-
-        for account in accounts {
-            lines.push(format!("  - {}: {}", account, self.balances.get(&account).unwrap()));
-        }
-
-        lines.join("\n")
-    }
+fn lock_state_file() -> Result<File, String> {
+    let path = state_path().with_extension("lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    FileExt::lock_exclusive(&lock)
+        .map_err(|error| format!("could not lock {}: {error}", path.display()))?;
+    Ok(lock)
 }
 
-pub fn run_benchmark(tx_count: u64, batch_size: u64) -> BenchmarkResult {
-    let mut ledger = Ledger::new();
-    let tx_target = tx_count.max(1);
-    let batch_target = batch_size.max(1);
-
-    let start = std::time::Instant::now();
-    let mut generated = 0u64;
-    let mut blocks = 0u64;
-
-    while generated < tx_target {
-        let remaining = tx_target - generated;
-        let current_batch = remaining.min(batch_target);
-
-        for i in 0..current_batch {
-            let sender = match (generated + i) % 8 {
-                0 => "alice",
-                1 => "bob",
-                2 => "charlie",
-                3 => "dana",
-                4 => "erin",
-                5 => "frank",
-                6 => "grace",
-                _ => "henry",
-            };
-
-            let recipient = match ((generated + i + 3) % 8) {
-                0 => "alice",
-                1 => "bob",
-                2 => "charlie",
-                3 => "dana",
-                4 => "erin",
-                5 => "frank",
-                6 => "grace",
-                _ => "henry",
-            };
-
-            let _ = ledger.transfer(sender, recipient, 1 + ((generated + i) % 50));
-            generated += 1;
+fn load_ledger() -> Result<Ledger, String> {
+    let path = state_path();
+    match fs::read(&path) {
+        Ok(contents) => {
+            let ledger: Ledger = serde_json::from_slice(&contents)
+                .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+            ledger
+                .validate()
+                .map_err(|error| format!("invalid ledger state in {}: {error}", path.display()))?;
+            Ok(ledger)
         }
-
-        let _ = ledger.mine_block();
-        blocks += 1;
-    }
-
-    let elapsed = start.elapsed();
-    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-    let tx_per_second = (tx_target as f64 / elapsed.as_secs_f64()).max(0.0);
-
-    BenchmarkResult {
-        tx_count: tx_target,
-        elapsed_ms,
-        tx_per_second,
-        block_count: blocks,
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Ledger::new()),
+        Err(error) => Err(format!("could not read {}: {error}", path.display())),
     }
 }
 
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+fn save_ledger(ledger: &Ledger) -> Result<(), String> {
+    let path = state_path();
+    let temporary_path = path.with_extension("json.tmp");
+    let contents = serde_json::to_vec(ledger)
+        .map_err(|error| format!("could not serialize ledger: {error}"))?;
+    fs::write(&temporary_path, contents)
+        .map_err(|error| format!("could not write {}: {error}", temporary_path.display()))?;
+    fs::rename(&temporary_path, &path)
+        .map_err(|error| format!("could not save {}: {error}", path.display()))
 }
 
-fn compute_stealth_commitment(sender: &str, recipient: &str, nonce: u64, amount: u64, timestamp: i64) -> String {
-    let payload = format!("stealth:{}|{}|{}|{}|{}", sender, recipient, nonce, amount, timestamp);
-    format!("{:x}", blake3::hash(payload.as_bytes()))
+fn required_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
+    args.next()
+        .ok_or_else(|| format!("missing {name}\n{}", usage()))
 }
 
-fn compute_nullifier(sender: &str, nonce: u64) -> String {
-    let payload = format!("nullifier:{}|{}", sender, nonce);
-    format!("{:x}", blake3::hash(payload.as_bytes()))
+fn parse_u64(value: &str, name: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{name} must be a non-negative integer: {value}"))
 }
 
-fn compute_signature(sender: &str, recipient: &str, amount: u64, nonce: u64, stealth_commitment: &str) -> String {
-    let payload = format!("sig:{}|{}|{}|{}|{}", sender, recipient, amount, nonce, stealth_commitment);
-    format!("{:x}", blake3::hash(payload.as_bytes()))
+fn print_usage() {
+    println!("{}", usage());
 }
 
-fn compute_merkle_root(leaves: &[String]) -> String {
-    if leaves.is_empty() {
-        return "0x0".to_string();
-    }
+fn usage() -> &'static str {
+    "usage: resonant <status|balance ACCOUNT|stake ACCOUNT AMOUNT|wallet list|wallet create LABEL|transfer SENDER RECIPIENT AMOUNT|mine|pending|benchmark [TX_COUNT] [BATCH_SIZE]>"
+}
 
-    let mut current = leaves.to_vec();
-    while current.len() > 1 {
-        let mut next = Vec::with_capacity((current.len() + 1) / 2);
-        for chunk in current.chunks(2) {
-            let left = &chunk[0];
-            let right = if chunk.len() == 2 { &chunk[1] } else { &chunk[0] };
-            let merged = format!("{}{}", left, right);
-            next.push(format!("{:x}", blake3::hash(merged.as_bytes())));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ledger_state_round_trips_through_state_file() {
+        let path = std::env::temp_dir().join(format!(
+            "resonant-ledger-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let previous_path = std::env::var_os("RESONANT_LEDGER_PATH");
+        std::env::set_var("RESONANT_LEDGER_PATH", &path);
+
+        let result = (|| {
+            let mut ledger = Ledger::new();
+            ledger.stake("alice", 25)?;
+            ledger.transfer("alice", "bob", 25)?;
+            save_ledger(&ledger)?;
+
+            let mut restored = load_ledger()?;
+            assert_eq!(restored.pending.len(), 1);
+            assert_eq!(restored.stake_of("alice"), 25);
+            let block = restored.mine_block()?;
+            assert_eq!(block.transactions.len(), 1);
+            assert_eq!(restored.balance_of("alice"), 1_000_000_000 - 26);
+
+            fs::write(
+                &path,
+                br#"{"balances":{},"pending":[],"chain":[],"nonce":0}"#,
+            )
+            .map_err(|error| error.to_string())?;
+            assert!(load_ledger()
+                .unwrap_err()
+                .contains("ledger chain must contain a genesis block"));
+            Ok::<(), String>(())
+        })();
+
+        match previous_path {
+            Some(value) => std::env::set_var("RESONANT_LEDGER_PATH", value),
+            None => std::env::remove_var("RESONANT_LEDGER_PATH"),
         }
-        current = next;
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("json.tmp"));
+        result.unwrap();
     }
-
-    current[0].clone()
 }
