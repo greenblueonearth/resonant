@@ -14,6 +14,8 @@ pub struct Transaction {
     pub timestamp: i64,
     pub stealth_commitment: String,
     pub nullifier: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub public_key: String,
     pub signature: String,
 }
 
@@ -42,9 +44,11 @@ fn genesis_validator() -> String {
     "GENESIS".to_string()
 }
 
+const GENESIS_TIMESTAMP: i64 = 0;
+
 impl Block {
     pub fn genesis() -> Self {
-        let timestamp = unix_now();
+        let timestamp = GENESIS_TIMESTAMP;
         let prev_hash = "GENESIS".to_string();
         let hash = blake3::hash(format!("{}:{}:genesis", timestamp, prev_hash).as_bytes())
             .to_hex()
@@ -106,6 +110,36 @@ impl Ledger {
         wallet
     }
 
+    pub fn import_wallet(&mut self, wallet: &Wallet) -> Result<(), String> {
+        if Wallet::address_for_public_key(&wallet.public_key)? != wallet.address
+            || !Wallet::verify(
+                &wallet.public_key,
+                b"validator-key-check",
+                &wallet.sign(b"validator-key-check")?,
+            )
+        {
+            return Err("invalid wallet signing key".to_string());
+        }
+        if self.balances.contains_key(&wallet.address) {
+            return Err("wallet already exists in ledger".to_string());
+        }
+        self.balances.insert(wallet.address.clone(), 10_000);
+        Ok(())
+    }
+
+    pub fn validate_block_for_consensus(&self, block: &Block) -> Result<(), String> {
+        self.validate_block(block)?;
+        for transaction in &block.transactions {
+            validate_transaction_authorization(transaction)?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_consensus_block(&mut self, block: Block) -> Result<(), String> {
+        self.validate_block_for_consensus(&block)?;
+        self.apply_block(block)
+    }
+
     pub fn stake(&mut self, account: &str, amount: u64) -> Result<u64, String> {
         if account.trim().is_empty() {
             return Err("validator account must not be empty".to_string());
@@ -146,6 +180,34 @@ impl Ledger {
         self.stakes.get(account).copied().unwrap_or(0)
     }
 
+    pub fn set_stake_amount(&mut self, account: &str, amount: u64) -> Result<(), String> {
+        if account.trim().is_empty() {
+            return Err("validator account must not be empty".to_string());
+        }
+        if amount > self.balance_of(account) {
+            return Err(format!("stake exceeds balance for {account}"));
+        }
+        let mut candidate = self.clone();
+        if amount == 0 {
+            candidate.stakes.remove(account);
+        } else {
+            candidate.stakes.insert(account.to_string(), amount);
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub fn height(&self) -> u64 {
+        u64::try_from(self.chain.len().saturating_sub(1)).unwrap_or(u64::MAX)
+    }
+
+    pub fn block_hash_at(&self, height: u64) -> Option<&str> {
+        self.chain
+            .get(usize::try_from(height).ok()?)
+            .map(|block| block.hash.as_str())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.chain.is_empty() {
             return Err("ledger chain must contain a genesis block".to_string());
@@ -157,6 +219,7 @@ impl Ledger {
                 .to_hex()
                 .to_string();
         if genesis.validator != "GENESIS"
+            || genesis.timestamp != GENESIS_TIMESTAMP
             || genesis.prev_hash != "GENESIS"
             || !genesis.stake_snapshot.is_empty()
             || !genesis.transactions.is_empty()
@@ -180,13 +243,6 @@ impl Ledger {
                     select_pos_validator(&block.prev_hash, block.index, &block.stake_snapshot)?;
                 if block.validator != expected_validator {
                     return Err(format!("incorrect proposer for block {index}"));
-                }
-                for (account, amount) in &block.stake_snapshot {
-                    if self.stake_of(account) < *amount {
-                        return Err(format!(
-                            "stake snapshot exceeds current stake for {account}"
-                        ));
-                    }
                 }
                 let tx_hashes: Vec<_> = block.transactions.iter().map(Transaction::hash).collect();
                 if compute_merkle_root(&tx_hashes) != block.merkle_root
@@ -219,6 +275,7 @@ impl Ledger {
                         block.index
                     ));
                 }
+                validate_transaction_integrity(tx)?;
             }
         }
 
@@ -237,6 +294,7 @@ impl Ledger {
             {
                 return Err(format!("invalid or duplicate nonce in {}", tx.id));
             }
+            validate_transaction_integrity(tx)?;
             if !self.balances.contains_key(&tx.sender) {
                 return Err(format!("unknown sender in pending transaction {}", tx.id));
             }
@@ -346,11 +404,35 @@ impl Ledger {
             timestamp,
             stealth_commitment,
             nullifier,
+            public_key: String::new(),
             signature,
         };
 
         self.pending.push(tx.clone());
         Ok(tx)
+    }
+
+    pub fn transfer_signed(
+        &mut self,
+        wallet: &Wallet,
+        recipient: &str,
+        amount: u64,
+    ) -> Result<Transaction, String> {
+        if Wallet::address_for_public_key(&wallet.public_key)? != wallet.address {
+            return Err("wallet address does not match public key".to_string());
+        }
+        let mut candidate = self.clone();
+        let mut transaction = candidate.transfer(&wallet.address, recipient, amount)?;
+        transaction.public_key = wallet.public_key.clone();
+        transaction.signature = wallet.sign(&transaction_signing_message(&transaction))?;
+        let pending = candidate
+            .pending
+            .last_mut()
+            .ok_or_else(|| "created transaction is missing from pending pool".to_string())?;
+        *pending = transaction.clone();
+        candidate.validate()?;
+        *self = candidate;
+        Ok(transaction)
     }
 
     pub fn mine_block(&mut self) -> Result<Block, String> {
@@ -373,24 +455,9 @@ impl Ledger {
         stake_snapshot.sort_by(|left, right| left.0.cmp(&right.0));
         let validator = select_pos_validator(&prev_hash, index, &stake_snapshot)?;
 
-        let mut next_balances = self.balances.clone();
         let mut tx_hashes = Vec::with_capacity(txs.len());
         for tx in &txs {
             tx_hashes.push(tx.hash());
-            let cost = tx
-                .amount
-                .checked_add(tx.fee)
-                .ok_or_else(|| format!("amount plus fee overflows in {}", tx.id))?;
-            let sender_balance = next_balances
-                .get_mut(&tx.sender)
-                .ok_or_else(|| format!("unknown sender in pending transaction {}", tx.id))?;
-            *sender_balance = sender_balance
-                .checked_sub(cost)
-                .ok_or_else(|| format!("pending transaction {} overspends", tx.id))?;
-            let recipient_balance = next_balances.entry(tx.recipient.clone()).or_insert(0);
-            *recipient_balance = recipient_balance
-                .checked_add(tx.amount)
-                .ok_or_else(|| format!("recipient balance overflows in {}", tx.id))?;
         }
 
         let merkle_root = compute_merkle_root(&tx_hashes);
@@ -406,10 +473,128 @@ impl Ledger {
         };
         block.hash = compute_pos_block_hash(&block);
 
-        self.balances = next_balances;
-        self.pending.clear();
-        self.chain.push(block.clone());
+        self.apply_block(block.clone())?;
         Ok(block)
+    }
+
+    pub fn validate_block(&self, block: &Block) -> Result<(), String> {
+        self.validate()?;
+        let expected_index =
+            u64::try_from(self.chain.len()).map_err(|_| "block index exceeds u64".to_string())?;
+        let previous = self
+            .chain
+            .last()
+            .ok_or_else(|| "ledger chain must contain a genesis block".to_string())?;
+        if block.index != expected_index {
+            return Err(format!(
+                "block index {} is not the next ledger index {expected_index}",
+                block.index
+            ));
+        }
+        if block.prev_hash != previous.hash {
+            return Err("block does not extend the current ledger tip".to_string());
+        }
+        let mut expected_snapshot: Vec<_> = self
+            .stakes
+            .iter()
+            .map(|(address, amount)| (address.clone(), *amount))
+            .collect();
+        expected_snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        if block.stake_snapshot != expected_snapshot {
+            return Err("block stake snapshot does not match the current ledger state".to_string());
+        }
+        let expected_validator =
+            select_pos_validator(&block.prev_hash, block.index, &block.stake_snapshot)?;
+        if block.validator != expected_validator {
+            return Err("block proposer is invalid".to_string());
+        }
+        let tx_hashes: Vec<_> = block.transactions.iter().map(Transaction::hash).collect();
+        if compute_merkle_root(&tx_hashes) != block.merkle_root
+            || compute_pos_block_hash(block) != block.hash
+        {
+            return Err("block commitment is invalid".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn apply_block(&mut self, block: Block) -> Result<(), String> {
+        self.validate_block(&block)?;
+        let mut candidate = self.clone();
+        let mut next_balances = candidate.balances.clone();
+        let mut chain_nonce = candidate
+            .chain
+            .iter()
+            .flat_map(|existing| existing.transactions.iter().map(|tx| tx.nonce))
+            .max()
+            .unwrap_or(0);
+        let mut next_nonce = candidate.nonce;
+        let mut known_ids: HashSet<_> = candidate
+            .chain
+            .iter()
+            .flat_map(|existing| existing.transactions.iter().map(|tx| tx.id.as_str()))
+            .collect();
+
+        for tx in &block.transactions {
+            if tx.amount == 0
+                || tx.sender.trim().is_empty()
+                || tx.recipient.trim().is_empty()
+                || tx.sender == tx.recipient
+            {
+                return Err(format!("invalid transaction {}", tx.id));
+            }
+            if tx.nonce <= chain_nonce || tx.id != format!("tx-{}", tx.nonce) {
+                return Err(format!("invalid transaction nonce or id in {}", tx.id));
+            }
+            validate_transaction_integrity(tx)?;
+            if let Some(pending) = candidate.pending.iter().find(|pending| pending.id == tx.id) {
+                if pending.hash() != tx.hash() {
+                    return Err(format!(
+                        "block transaction {} conflicts with local pending transaction",
+                        tx.id
+                    ));
+                }
+            }
+            if !known_ids.insert(tx.id.as_str()) {
+                return Err(format!("duplicate transaction {}", tx.id));
+            }
+            let cost = tx
+                .amount
+                .checked_add(tx.fee)
+                .ok_or_else(|| format!("amount plus fee overflows in {}", tx.id))?;
+            let sender_balance = next_balances
+                .get_mut(&tx.sender)
+                .ok_or_else(|| format!("unknown sender in transaction {}", tx.id))?;
+            if sender_balance.saturating_sub(candidate.stake_of(&tx.sender)) < cost {
+                return Err(format!("transaction {} overspends its sender", tx.id));
+            }
+            *sender_balance = sender_balance
+                .checked_sub(cost)
+                .ok_or_else(|| format!("transaction {} overspends its sender", tx.id))?;
+            let recipient_balance = next_balances.entry(tx.recipient.clone()).or_insert(0);
+            *recipient_balance = recipient_balance
+                .checked_add(tx.amount)
+                .ok_or_else(|| format!("recipient balance overflows in {}", tx.id))?;
+            chain_nonce = tx.nonce;
+            next_nonce = next_nonce.max(tx.nonce);
+        }
+
+        let included_ids: HashSet<_> = block.transactions.iter().map(|tx| tx.id.clone()).collect();
+        candidate.balances = next_balances;
+        candidate.nonce = next_nonce;
+        candidate.chain.push(block);
+        let previous_pending = std::mem::take(&mut candidate.pending);
+        for tx in previous_pending {
+            if included_ids.contains(&tx.id) {
+                continue;
+            }
+            candidate.pending.push(tx);
+            if candidate.validate().is_err() {
+                candidate.pending.pop();
+            }
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
     }
 
     pub fn balance_of(&self, account: &str) -> u64 {
@@ -632,6 +817,72 @@ fn compute_signature(
     blake3::hash(payload.as_bytes()).to_hex().to_string()
 }
 
+fn transaction_signing_message(tx: &Transaction) -> Vec<u8> {
+    serde_json::to_vec(&(
+        "resonant/transaction-signature/v1",
+        &tx.id,
+        &tx.sender,
+        &tx.recipient,
+        tx.amount,
+        tx.fee,
+        tx.nonce,
+        tx.timestamp,
+        &tx.stealth_commitment,
+        &tx.nullifier,
+        &tx.public_key,
+    ))
+    .expect("transaction signing message serialization is infallible")
+}
+
+pub fn validate_transaction_authorization(tx: &Transaction) -> Result<(), String> {
+    if tx.public_key.is_empty()
+        || Wallet::address_for_public_key(&tx.public_key)
+            .map_err(|error| format!("invalid transaction public key: {error}"))?
+            != tx.sender
+        || !Wallet::verify(
+            &tx.public_key,
+            &transaction_signing_message(tx),
+            &tx.signature,
+        )
+    {
+        return Err(format!("invalid transaction authorization in {}", tx.id));
+    }
+    Ok(())
+}
+
+fn validate_transaction_integrity(tx: &Transaction) -> Result<(), String> {
+    if tx.id != format!("tx-{}", tx.nonce)
+        || tx.fee != 1
+        || tx.stealth_commitment
+            != compute_stealth_commitment(
+                &tx.sender,
+                &tx.recipient,
+                tx.nonce,
+                tx.amount,
+                tx.timestamp,
+            )
+        || tx.nullifier != compute_nullifier(&tx.sender, tx.nonce)
+    {
+        return Err(format!("invalid transaction commitment in {}", tx.id));
+    }
+    if tx.public_key.is_empty() {
+        if tx.signature
+            != compute_signature(
+                &tx.sender,
+                &tx.recipient,
+                tx.amount,
+                tx.nonce,
+                &tx.stealth_commitment,
+            )
+        {
+            return Err(format!("invalid transaction commitment in {}", tx.id));
+        }
+    } else {
+        validate_transaction_authorization(tx)?;
+    }
+    Ok(())
+}
+
 fn compute_merkle_root(leaves: &[String]) -> String {
     if leaves.is_empty() {
         return "0x0".to_string();
@@ -677,6 +928,68 @@ mod tests {
         assert!(ledger.pending.is_empty());
         assert_eq!(ledger.balance_of("alice"), alice_initial - 251);
         assert_eq!(ledger.balance_of("bob"), bob_initial + 250);
+    }
+
+    #[test]
+    fn applying_a_valid_remote_block_updates_state() {
+        let mut proposer = Ledger::new();
+        proposer.transfer("alice", "bob", 250).unwrap();
+        let block = proposer.mine_block().unwrap();
+        let mut receiver = Ledger::new();
+
+        receiver.apply_block(block).unwrap();
+
+        assert_eq!(receiver.height(), 1);
+        assert_eq!(receiver.balance_of("alice"), 1_000_000_000 - 251);
+        assert_eq!(receiver.balance_of("bob"), 1_000_000_250);
+        assert!(receiver.pending.is_empty());
+        assert!(receiver.validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_remote_block_does_not_mutate_ledger() {
+        let mut proposer = Ledger::new();
+        proposer.transfer("alice", "bob", 250).unwrap();
+        let mut block = proposer.mine_block().unwrap();
+        block.transactions[0].amount += 1;
+        let mut receiver = Ledger::new();
+        let initial_alice = receiver.balance_of("alice");
+        let initial_bob = receiver.balance_of("bob");
+
+        assert!(receiver.apply_block(block).is_err());
+        assert_eq!(receiver.height(), 0);
+        assert_eq!(receiver.balance_of("alice"), initial_alice);
+        assert_eq!(receiver.balance_of("bob"), initial_bob);
+        assert!(receiver.validate().is_ok());
+    }
+
+    #[test]
+    fn stake_updates_preserve_historical_block_snapshots() {
+        let mut ledger = Ledger::new();
+        ledger.stake("alice", 100).unwrap();
+        let first = ledger.mine_block().unwrap();
+
+        ledger.set_stake_amount("alice", 50).unwrap();
+
+        assert_eq!(ledger.stake_of("alice"), 50);
+        assert_eq!(
+            first.stake_snapshot,
+            vec![("alice".to_string(), 100), ("henry".to_string(), 1)]
+        );
+        assert!(ledger.validate().is_ok());
+        assert_eq!(
+            ledger.mine_block().unwrap().stake_snapshot,
+            vec![("alice".to_string(), 50), ("henry".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn failed_stake_update_does_not_mutate_ledger() {
+        let mut ledger = Ledger::new();
+        let original = ledger.stake_of("alice");
+
+        assert!(ledger.set_stake_amount("alice", u64::MAX).is_err());
+        assert_eq!(ledger.stake_of("alice"), original);
     }
 
     #[test]

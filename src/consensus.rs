@@ -85,13 +85,22 @@ impl ConsensusEngine {
         {
             return Err("invalid validator signing key".to_string());
         }
-        if Wallet::address_for_public_key(&wallet.public_key)? != wallet.address {
+        self.register_public_validator(&wallet.address, &wallet.public_key, stake)
+    }
+
+    pub fn register_public_validator(
+        &mut self,
+        address: &str,
+        public_key: &str,
+        stake: u64,
+    ) -> Result<(), String> {
+        if Wallet::address_for_public_key(public_key)? != address {
             return Err("validator address does not match public key".to_string());
         }
         if stake == 0 {
             return Err("validator stake must be greater than zero".to_string());
         }
-        if self.validators.contains_key(&wallet.address) {
+        if self.validators.contains_key(address) {
             return Err("validator is already registered".to_string());
         }
         self.validators
@@ -99,10 +108,10 @@ impl ConsensusEngine {
             .try_fold(stake, |total, validator| total.checked_add(validator.stake))
             .ok_or_else(|| "total validator stake overflows".to_string())?;
         self.validators.insert(
-            wallet.address.clone(),
+            address.to_string(),
             Validator {
-                address: wallet.address.clone(),
-                public_key: wallet.public_key.clone(),
+                address: address.to_string(),
+                public_key: public_key.to_string(),
                 stake,
                 jailed: false,
                 total_slashed: 0,
@@ -122,6 +131,45 @@ impl ConsensusEngine {
 
     pub fn finalized_height(&self) -> u64 {
         self.finalized_height
+    }
+
+    pub fn vote_for(&self, height: u64, validator: &str) -> Option<&SignedVote> {
+        self.votes
+            .get(&height)?
+            .iter()
+            .find(|vote| vote.validator == validator)
+    }
+
+    pub fn verify_vote(&self, vote: &SignedVote) -> Result<(), String> {
+        let validator = self
+            .validators
+            .get(&vote.validator)
+            .ok_or_else(|| "unknown validator".to_string())?;
+        if !Wallet::verify(
+            &validator.public_key,
+            &vote_message(vote.height, &vote.block_hash, &vote.validator),
+            &vote.signature,
+        ) {
+            return Err("invalid validator signature".to_string());
+        }
+        let snapshot = self
+            .stake_snapshots
+            .get(&vote.height)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.validators
+                    .values()
+                    .filter(|validator| !validator.jailed && validator.stake > 0)
+                    .map(|validator| (validator.address.clone(), validator.stake))
+                    .collect()
+            });
+        if !snapshot
+            .iter()
+            .any(|(address, amount)| address == &vote.validator && *amount > 0)
+        {
+            return Err("validator is not in this height's stake snapshot".to_string());
+        }
+        Ok(())
     }
 
     pub fn certificate(&self, height: u64) -> Option<&FinalityCertificate> {
@@ -236,6 +284,22 @@ impl ConsensusEngine {
         if certificate.height == 0 || certificate.block_hash.is_empty() {
             return Err("certificate height and block hash must be non-empty".to_string());
         }
+        let expected_snapshot: Vec<_> = self
+            .stake_snapshots
+            .get(&certificate.height)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.validators
+                    .values()
+                    .filter(|validator| !validator.jailed && validator.stake > 0)
+                    .map(|validator| (validator.address.clone(), validator.stake))
+                    .collect()
+            });
+        if certificate.stake_snapshot != expected_snapshot {
+            return Err(
+                "certificate stake snapshot does not match registered validators".to_string(),
+            );
+        }
         let mut previous_address: Option<&str> = None;
         let mut total_stake = 0u64;
         for (address, stake) in &certificate.stake_snapshot {
@@ -273,6 +337,9 @@ impl ConsensusEngine {
                 .validators
                 .get(&vote.validator)
                 .ok_or_else(|| "certificate references unknown validator".to_string())?;
+            if validator.jailed || validator.stake == 0 {
+                return Err("certificate contains a vote from an ineligible validator".to_string());
+            }
             if !Wallet::verify(
                 &validator.public_key,
                 &vote_message(vote.height, &vote.block_hash, &vote.validator),
@@ -290,6 +357,45 @@ impl ConsensusEngine {
         if !has_quorum(signed_stake, total_stake) {
             return Err("certificate does not have a two-thirds stake quorum".to_string());
         }
+        Ok(())
+    }
+
+    pub fn submit_certificate(&mut self, certificate: FinalityCertificate) -> Result<(), String> {
+        if certificate.height != self.finalized_height.saturating_add(1) {
+            return Err("certificate height is not the next finality height".to_string());
+        }
+        self.verify_certificate(&certificate)?;
+
+        let mut candidate = self.clone();
+        let known_votes = candidate.votes.entry(certificate.height).or_default();
+        for vote in &certificate.votes {
+            if let Some(existing) = known_votes
+                .iter()
+                .find(|existing| existing.validator == vote.validator)
+            {
+                if existing != vote {
+                    return Err(
+                        "certificate conflicts with a previously submitted vote".to_string()
+                    );
+                }
+            } else {
+                known_votes.push(vote.clone());
+            }
+        }
+        if let Some(snapshot) = candidate.stake_snapshots.get(&certificate.height) {
+            if snapshot != &certificate.stake_snapshot {
+                return Err("certificate stake snapshot conflicts with local state".to_string());
+            }
+        } else {
+            candidate
+                .stake_snapshots
+                .insert(certificate.height, certificate.stake_snapshot.clone());
+        }
+        candidate.finalized_height = certificate.height;
+        candidate
+            .certificates
+            .insert(certificate.height, certificate);
+        *self = candidate;
         Ok(())
     }
 
@@ -1114,6 +1220,32 @@ mod tests {
         fn valid_certificate_verifies() {
             let (engine, _, certificate) = certificate(&[50, 30, 20]);
             assert!(engine.verify_certificate(&certificate).is_ok());
+        }
+
+        #[test]
+        fn imported_certificate_advances_finality_atomically() {
+            let (_, wallets, certificate) = certificate(&[50, 30, 20]);
+            let mut receiver = ConsensusEngine::new(3);
+            for (wallet, stake) in wallets.iter().zip([50, 30, 20]) {
+                receiver.register_validator(wallet, stake).unwrap();
+            }
+
+            receiver.submit_certificate(certificate.clone()).unwrap();
+
+            assert_eq!(receiver.finalized_height(), 1);
+            assert_eq!(receiver.certificate(1), Some(&certificate));
+        }
+
+        #[test]
+        fn invalid_imported_certificate_does_not_advance_finality() {
+            let (_, wallets, mut certificate) = certificate(&[100]);
+            certificate.votes[0].signature = "00".repeat(64);
+            let mut receiver = ConsensusEngine::new(3);
+            receiver.register_validator(&wallets[0], 100).unwrap();
+
+            assert!(receiver.submit_certificate(certificate).is_err());
+            assert_eq!(receiver.finalized_height(), 0);
+            assert!(receiver.certificate(1).is_none());
         }
 
         #[test]
